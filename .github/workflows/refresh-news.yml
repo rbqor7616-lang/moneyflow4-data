@@ -1,0 +1,66 @@
+name: Refresh news
+
+on:
+  schedule:
+    - cron: '20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-news
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # snapshot.json is a single-line JSON document, so git can never text-merge
+      # it. Instead of rebasing, every attempt resets to the tip of the branch and
+      # re-runs the refresh: the script itself is the merge - it rewrites only the
+      # news block and de-duplicates fearGreedHistory, leaving the external
+      # writer's prices untouched.
+      - name: Refresh news and push
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in 1 2 3; do
+            echo "--- attempt $attempt: syncing with origin/$BRANCH ---"
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+
+            python3 scripts/refresh_news.py
+
+            if git diff --quiet snapshot.json; then
+              echo "no change"
+              exit 0
+            fi
+
+            git add snapshot.json
+            git commit -m "news refresh $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+            if git push origin "HEAD:$BRANCH"; then
+              echo "pushed"
+              exit 0
+            fi
+
+            echo "push rejected (origin/$BRANCH moved); re-running against the new tip"
+            sleep $((attempt * 5))
+          done
+          echo "push failed after 3 attempts" >&2
+          exit 1
